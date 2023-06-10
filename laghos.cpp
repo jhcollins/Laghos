@@ -63,6 +63,8 @@
 #include <sys/time.h>
 #include <sys/resource.h>
 #include "laghos_solver.hpp"
+#include "marking.hpp"
+
 
 using std::cout;
 using std::endl;
@@ -75,11 +77,14 @@ static int problem, dim;
 double e0(const Vector &);
 double rho0(const Vector &);
 double gamma_func(const Vector &);
+double phi0(std::vector<double>);
+double phi1(std::vector<double>);
 void v0(const Vector &, Vector &);
 
 static long GetMaxRssMB();
 static void display_banner(std::ostream&);
 static void Checks(const int ti, const double norm, int &checks);
+
 
 int main(int argc, char *argv[])
 {
@@ -413,6 +418,10 @@ int main(int argc, char *argv[])
    H1_FECollection H1FEC(order_v, dim);
    ParFiniteElementSpace L2FESpace(pmesh, &L2FEC);
    ParFiniteElementSpace H1FESpace(pmesh, &H1FEC, pmesh->Dimension());
+   ParFiniteElementSpace H1FESpace2(pmesh, &H1FEC);
+
+   DG_FECollection DGFEC(order_v, dim);
+   ParFiniteElementSpace DGFESpace(pmesh, &DGFEC);
 
    // Boundary conditions: all tests use v.n = 0 on the boundary, and we assume
    // that the boundaries are straight.
@@ -472,6 +481,7 @@ int main(int argc, char *argv[])
    offset[0] = 0;
    offset[1] = offset[0] + Vsize_h1;
    offset[2] = offset[1] + Vsize_h1;
+   std::cout<<offset[2]<<"offset"<<std::endl;
    offset[3] = offset[2] + Vsize_l2;
    BlockVector S(offset, Device::GetMemoryType());
 
@@ -483,6 +493,54 @@ int main(int argc, char *argv[])
    x_gf.MakeRef(&H1FESpace, S, offset[0]);
    v_gf.MakeRef(&H1FESpace, S, offset[1]);
    e_gf.MakeRef(&L2FESpace, S, offset[2]);
+
+   pmesh->SetNodalFESpace(&H1FESpace);
+
+   ParGridFunction sdf0(&H1FESpace2);
+   ParGridFunction sdf1(&H1FESpace2);
+   
+   ParGridFunction vof0(&H1FESpace2);
+   ParGridFunction vof1(&H1FESpace2);
+   
+   ParGridFunction materials(&H1FESpace2);
+   ParGridFunction celltags(&DGFESpace);   
+
+   ParGridFunction alpha0(&H1FESpace2);
+   ParGridFunction alpha1(&H1FESpace2);
+   ParGridFunction alpha2(&H1FESpace2);
+
+   std::vector<ParGridFunction*> VOFs;
+   std::vector<ParGridFunction*> alphas;
+
+   MarkingLS LSM;
+
+   LSM.createSDF(pmesh,sdf0, &phi0);
+   LSM.createSDF(pmesh,sdf1, &phi1);
+
+   LSM.mapVOFToNodes(sdf0, vof0);
+   LSM.mapVOFToNodes(sdf1, vof1);
+
+   VOFs= {&vof0, &vof1};
+   alphas={&alpha0,&alpha1,&alpha2};
+
+   LSM.orderedAlpha(VOFs,alphas);
+   LSM.markMaterials(materials,alphas);
+
+   LSM.tagCells(pmesh, materials,celltags);
+
+   ParaViewDataCollection *pd = NULL;
+   pd = new ParaViewDataCollection("Example1P", pmesh);
+   pd->SetPrefixPath("ParaView");
+   pd->RegisterField("cell tags", (&celltags));
+   pd->SetLevelsOfDetail(1);
+   pd->SetDataFormat(VTKFormat::BINARY);
+   pd->SetHighOrderOutput(true);
+   pd->SetCycle(0);
+   pd->SetTime(0.0);
+   pd->Save();
+
+   delete pd;
+
 
    // Initialize x_gf using the starting mesh coordinates.
    pmesh->SetNodalGridFunction(&x_gf);
@@ -560,7 +618,7 @@ int main(int argc, char *argv[])
                                                 cg_tol, cg_max_iter, ftz_tol,
                                                 order_q);
 
-   socketstream vis_rho, vis_v, vis_e;
+   socketstream vis_rho, vis_v, vis_e,vis_m,vis_m2,vis_m3,vis_m4;
    char vishost[] = "localhost";
    int  visport   = 19916;
 
@@ -577,6 +635,11 @@ int main(int argc, char *argv[])
       vis_rho.precision(8);
       vis_v.precision(8);
       vis_e.precision(8);
+      vis_m.precision(8);
+      vis_m2.precision(8);
+      vis_m3.precision(8);
+      vis_m4.precision(8);
+
       int Wx = 0, Wy = 0; // window position
       const int Ww = 350, Wh = 350; // window size
       int offx = Ww+10; // window offsets
@@ -591,6 +654,20 @@ int main(int argc, char *argv[])
       Wx += offx;
       hydrodynamics::VisualizeField(vis_e, vishost, visport, e_gf,
                                     "Specific Internal Energy", Wx, Wy, Ww, Wh);
+      Wx += offx;
+      hydrodynamics::VisualizeField(vis_m, vishost, visport, sdf0,
+                                    "SDF0", Wx, Wy, Ww, Wh);
+      Wx += offx;
+      hydrodynamics::VisualizeField(vis_m2, vishost, visport, sdf1,
+                                    "SDF1", Wx, Wy, Ww, Wh);
+      Wx += offx;
+      hydrodynamics::VisualizeField(vis_m3, vishost, visport, materials,
+                                     "materials", Wx, Wy, Ww, Wh);
+      Wx += offx;
+      hydrodynamics::VisualizeField(vis_m4, vishost, visport, celltags,
+                                    "cell tags", Wx, Wy, Ww, Wh,false);
+      Wx += offx;
+
    }
 
    // Save data for VisIt visualization.
@@ -600,6 +677,8 @@ int main(int argc, char *argv[])
       visit_dc.RegisterField("Density",  &rho_gf);
       visit_dc.RegisterField("Velocity", &v_gf);
       visit_dc.RegisterField("Specific Internal Energy", &e_gf);
+      visit_dc.RegisterField("SDF", &sdf0);
+      //visit_dc.RegisterField("SDF", &sdf1);
       visit_dc.SetCycle(0);
       visit_dc.SetTime(0.0);
       visit_dc.Save();
@@ -743,6 +822,21 @@ int main(int argc, char *argv[])
                                           "Specific Internal Energy",
                                           Wx, Wy, Ww,Wh);
             Wx += offx;
+	    hydrodynamics::VisualizeField(vis_m, vishost, visport, sdf0,
+                                    "SDF0", Wx, Wy, Ww, Wh);
+	    Wx += offx;
+
+	    hydrodynamics::VisualizeField(vis_m2, vishost, visport, sdf1,
+                                    "SDF1", Wx, Wy, Ww, Wh);
+	    Wx += offx;
+  	    hydrodynamics::VisualizeField(vis_m3, vishost, visport, materials,
+                                    "materials", Wx, Wy, Ww, Wh);
+	    Wx += offx;
+	    hydrodynamics::VisualizeField(vis_m4, vishost, visport, celltags,
+					  "cell tags", Wx, Wy, Ww, Wh,false);
+	    Wx += offx;
+
+
          }
 
          if (visit)
@@ -852,11 +946,16 @@ int main(int argc, char *argv[])
    {
       vis_v.close();
       vis_e.close();
+      vis_m.close();
    }
+
+
+
 
    // Free the used memory.
    delete ode_solver;
    delete pmesh;
+   
 
    return 0;
 }
@@ -887,7 +986,20 @@ double rho0(const Vector &x)
       case 7: return x(1) >= 0.0 ? 2.0 : 1.0;
       default: MFEM_ABORT("Bad number given for problem id!"); return 0.0;
    }
+
+
+   
 }
+
+double phi0(std::vector<double> x){
+  return (x[0] > 1.0) ? 1.0 : -1.0;
+}
+
+double phi1(std::vector<double> x){
+  return (x[1] > 1.5) ? 1.0 : -1.0;
+}
+
+
 
 double gamma_func(const Vector &x)
 {
